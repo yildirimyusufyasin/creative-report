@@ -1,348 +1,470 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 
-type DistributionStyle = "balanced" | "moderate" | "high";
+type VarianceLevel = "balanced" | "medium" | "high";
+type Theme = "dark" | "light";
 
 interface CreativeRow {
-  id: number;
+  index: number;
+  name: string;
   impressions: number;
+  clicks: number;
   installs: number;
-  paidEvents: number;
+  primaryEvents: number;
+  secondaryEvents: number;
 }
 
-// ---- helpers ----
-
-function generateWeights(
-  count: number,
-  style: DistributionStyle
-): number[] {
+function generateWeights(count: number, variance: VarianceLevel): number[] {
   if (count <= 0) return [];
 
-  const raw: number[] = [];
-
-  for (let i = 0; i < count; i++) {
-    let w: number;
-
-    if (style === "balanced") {
-      // Around 1.0 with small noise
-      const noise = (Math.random() - 0.5) * 0.2; // [-0.1, +0.1]
-      w = 1 + noise;
-    } else if (style === "moderate") {
-      // Uniform between 0.5 and 1.5
-      w = 0.5 + Math.random();
-    } else {
-      // "high" variance: exponential-like distribution
-      // -log(U) gives lots of small values and a few big ones
-      const u = Math.random();
-      w = -Math.log(u + 1e-9);
-    }
-
-    if (w <= 0) w = 0.0001;
-    raw.push(w);
+  let factor: number;
+  switch (variance) {
+    case "balanced":
+      factor = 0.2;
+      break;
+    case "medium":
+      factor = 1.0;
+      break;
+    case "high":
+      factor = 3.0;
+      break;
   }
 
-  const sum = raw.reduce((a, b) => a + b, 0);
-  return raw.map((v) => v / sum);
+  const weights: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const w = 1 + Math.random() * factor;
+    weights.push(w);
+  }
+
+  const sum = weights.reduce((acc, v) => acc + v, 0);
+  return weights.map((w) => w / sum);
 }
 
-function distributeIntegerTotal(total: number, weights: number[]): number[] {
+function distribute(total: number, weights: number[]): number[] {
   if (total <= 0 || weights.length === 0) {
-    return weights.map(() => 0);
+    return Array(weights.length).fill(0);
   }
 
-  const rawValues = weights.map((w) => w * total);
-  const floors = rawValues.map((v) => Math.floor(v));
-  let assigned = floors.reduce((a, b) => a + b, 0);
-  let remainder = total - assigned;
+  const result = new Array(weights.length).fill(0);
+  let remaining = total;
 
-  // track fractional parts
-  const frac = rawValues.map((v, idx) => ({
-    idx,
-    frac: v - floors[idx],
-  }));
-
-  // sort descending by fractional part
-  frac.sort((a, b) => b.frac - a.frac);
-
-  const result = [...floors];
-  let i = 0;
-  while (remainder > 0 && i < frac.length) {
-    result[frac[i].idx] += 1;
-    remainder--;
-    i++;
+  for (let i = 0; i < weights.length; i++) {
+    if (i === weights.length - 1) {
+      result[i] = remaining;
+    } else {
+      const raw = total * weights[i];
+      const value = Math.round(raw);
+      result[i] = value;
+      remaining -= value;
+    }
   }
 
   return result;
 }
 
-function toCSV(rows: CreativeRow[]): string {
-  if (!rows.length) return "";
-  const headers = ["creative_id", "impressions", "installs", "paid_events"];
-  const escape = (v: any) => {
-    if (v == null) return "";
-    const s = String(v);
-    if (s.includes('"') || s.includes(",") || s.includes("\n")) {
-      return `"${s.replace(/"/g, '""')}"`;
-    }
-    return s;
-  };
-  const lines = [
-    headers.join(","),
-    ...rows.map((r) =>
-      [
-        escape(r.id),
-        escape(r.impressions),
-        escape(r.installs),
-        escape(r.paidEvents),
-      ].join(",")
-    ),
-  ];
-  return lines.join("\n");
-}
+const Page: React.FC = () => {
+  // THEME
+  const [theme, setTheme] = useState<Theme>("dark");
+  const isDark = theme === "dark";
 
-function downloadCSV(filename: string, rows: CreativeRow[]) {
-  const csv = toCSV(rows);
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
+  // INPUT STATES (string, first load = empty)
+  const [creativeCountInput, setCreativeCountInput] = useState<string>("");
 
-// ---- main page ----
+  const [totalImpressionsInput, setTotalImpressionsInput] =
+    useState<string>("");
+  const [totalClicksInput, setTotalClicksInput] = useState<string>("");
+  const [totalInstallsInput, setTotalInstallsInput] = useState<string>("");
+  const [totalPrimaryEventsInput, setTotalPrimaryEventsInput] =
+    useState<string>("");
+  const [totalSecondaryEventsInput, setTotalSecondaryEventsInput] =
+    useState<string>("");
 
-const CreativeDistributorPage: React.FC = () => {
-  const [creativeCount, setCreativeCount] = useState<number>(10);
-  const [totalImpressions, setTotalImpressions] = useState<number>(100000);
-  const [totalInstalls, setTotalInstalls] = useState<number>(2000);
-  const [totalPaidEvents, setTotalPaidEvents] = useState<number>(300);
-  const [style, setStyle] = useState<DistributionStyle>("balanced");
+  const [primaryEventLabel, setPrimaryEventLabel] =
+    useState<string>("Paid Events");
+  const [secondaryEventLabel, setSecondaryEventLabel] =
+    useState<string>("Second Event");
+  const [secondaryEventEnabled, setSecondaryEventEnabled] =
+    useState<boolean>(false);
 
-  const [rows, setRows] = useState<CreativeRow[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [variance, setVariance] = useState<VarianceLevel>("balanced");
 
-  const handleGenerate = () => {
-    setError(null);
-
-    if (
-      !Number.isFinite(creativeCount) ||
-      creativeCount <= 0 ||
-      !Number.isInteger(creativeCount)
-    ) {
-      setError("Number of creatives must be a positive integer.");
-      return;
-    }
-    if (totalImpressions < 0 || totalInstalls < 0 || totalPaidEvents < 0) {
-      setError("Totals cannot be negative.");
-      return;
-    }
-
-    const weights = generateWeights(creativeCount, style);
-
-    const impressionsDist = distributeIntegerTotal(totalImpressions, weights);
-    const installsDist = distributeIntegerTotal(totalInstalls, weights);
-    const eventsDist = distributeIntegerTotal(totalPaidEvents, weights);
-
-    const generated: CreativeRow[] = [];
-    for (let i = 0; i < creativeCount; i++) {
-      generated.push({
-        id: i + 1,
-        impressions: impressionsDist[i],
-        installs: installsDist[i],
-        paidEvents: eventsDist[i],
-      });
-    }
-
-    setRows(generated);
-  };
-
-  const totalsCheck = rows.reduce(
-    (acc, r) => {
-      acc.impressions += r.impressions;
-      acc.installs += r.installs;
-      acc.paidEvents += r.paidEvents;
-      return acc;
-    },
-    { impressions: 0, installs: 0, paidEvents: 0 }
+  // Parsed numeric values (empty => 0)
+  const creativeCount = useMemo(
+    () => Math.max(0, Number(creativeCountInput) || 0),
+    [creativeCountInput]
+  );
+  const totalImpressions = useMemo(
+    () => Math.max(0, Number(totalImpressionsInput) || 0),
+    [totalImpressionsInput]
+  );
+  const totalClicks = useMemo(
+    () => Math.max(0, Number(totalClicksInput) || 0),
+    [totalClicksInput]
+  );
+  const totalInstalls = useMemo(
+    () => Math.max(0, Number(totalInstallsInput) || 0),
+    [totalInstallsInput]
+  );
+  const totalPrimaryEvents = useMemo(
+    () => Math.max(0, Number(totalPrimaryEventsInput) || 0),
+    [totalPrimaryEventsInput]
+  );
+  const totalSecondaryEvents = useMemo(
+    () => Math.max(0, Number(totalSecondaryEventsInput) || 0),
+    [totalSecondaryEventsInput]
   );
 
+  const creatives: CreativeRow[] = useMemo(() => {
+    const n = Math.max(0, creativeCount);
+
+    const weights = generateWeights(n, variance);
+
+    const impressionsDist = distribute(totalImpressions, weights);
+    const clicksDist = distribute(totalClicks, weights);
+    const installsDist = distribute(totalInstalls, weights);
+    const primaryEventsDist = distribute(totalPrimaryEvents, weights);
+    const secondaryEventsDist = secondaryEventEnabled
+      ? distribute(totalSecondaryEvents, weights)
+      : Array(n).fill(0);
+
+    return Array.from({ length: n }, (_, i) => ({
+      index: i + 1,
+      name: `Creative ${i + 1}`,
+      impressions: impressionsDist[i] ?? 0,
+      clicks: clicksDist[i] ?? 0,
+      installs: installsDist[i] ?? 0,
+      primaryEvents: primaryEventsDist[i] ?? 0,
+      secondaryEvents: secondaryEventsDist[i] ?? 0,
+    }));
+  }, [
+    creativeCount,
+    totalImpressions,
+    totalClicks,
+    totalInstalls,
+    totalPrimaryEvents,
+    totalSecondaryEvents,
+    variance,
+    secondaryEventEnabled,
+  ]);
+
+  const exportCsv = () => {
+    if (!creatives.length) return;
+
+    const headers = [
+      "Creative",
+      "Impressions",
+      "Clicks",
+      "Installs",
+      primaryEventLabel,
+      secondaryEventEnabled ? secondaryEventLabel : undefined,
+    ].filter(Boolean) as string[];
+
+    const lines: string[] = [];
+    lines.push(headers.join(","));
+
+    for (const row of creatives) {
+      const cols: (string | number)[] = [
+        row.name,
+        row.impressions,
+        row.clicks,
+        row.installs,
+        row.primaryEvents,
+      ];
+      if (secondaryEventEnabled) {
+        cols.push(row.secondaryEvents);
+      }
+      lines.push(
+        cols
+          .map((v) => {
+            const s = String(v);
+            if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+              return `"${s.replace(/"/g, '""')}"`;
+            }
+            return s;
+          })
+          .join(",")
+      );
+    }
+
+    const csv = lines.join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "creative_distribution.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const pageBg = isDark ? "bg-slate-950 text-slate-50" : "bg-slate-50 text-slate-900";
+  const cardBg = isDark
+    ? "bg-slate-900/60 border border-slate-800"
+    : "bg-white border border-slate-200 shadow-sm";
+  const subtleText = isDark ? "text-slate-300" : "text-slate-600";
+  const inputBg =
+    "w-full rounded-md border px-2 py-1 text-xs " +
+    (isDark
+      ? "bg-slate-950 border-slate-700"
+      : "bg-white border-slate-300");
+
+  const buttonVariant = (active: boolean) =>
+    `px-3 py-1 rounded-md border text-xs ${
+      active
+        ? "bg-emerald-500 text-slate-950 border-emerald-400"
+        : isDark
+        ? "bg-slate-900 border-slate-700"
+        : "bg-slate-100 border-slate-300"
+    }`;
+
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-50 flex justify-center px-4 py-8">
+    <div
+      className={`min-h-screen ${pageBg} px-4 py-8 flex justify-center transition-colors`}
+    >
       <div className="w-full max-w-5xl space-y-6">
-        <header className="space-y-1">
-          <h1 className="text-3xl font-semibold">
-            Creative Metrics Distributor
-          </h1>
-          <p className="text-sm text-slate-300 max-w-2xl">
-            Generate synthetic per–creative metrics given total impressions,
-            installs, and paid events. Choose how evenly the numbers should
-            be spread across creatives.
-          </p>
+        <header className="flex items-start justify-between gap-4">
+          <div className="space-y-1">
+            <h1 className="text-3xl font-semibold">
+              Creative Report Distribution Helper
+            </h1>
+            <p className={`text-sm max-w-2xl ${subtleText}`}>
+              Enter your total numbers (impressions, clicks, installs, events)
+              and let the tool distribute them across creatives with different
+              variance options.
+            </p>
+          </div>
+          <button
+            onClick={() =>
+              setTheme((prev) => (prev === "dark" ? "light" : "dark"))
+            }
+            className="text-xs px-3 py-1.5 rounded-md border border-slate-500/60 bg-slate-900/20 hover:bg-slate-900/40 transition-colors"
+          >
+            {isDark ? "Switch to Light" : "Switch to Dark"}
+          </button>
         </header>
 
         {/* Inputs */}
-        <section className="bg-slate-900/60 rounded-xl border border-slate-800 p-4 space-y-4 text-sm">
+        <section className={`${cardBg} rounded-xl p-4 space-y-4`}>
           <h2 className="font-medium text-lg">Input parameters</h2>
-          <div className="grid sm:grid-cols-2 md:grid-cols-3 gap-4">
+
+          <div className="grid md:grid-cols-3 gap-4 text-sm">
             <div>
-              <label className="block text-xs text-slate-300 mb-1">
+              <label className={`block text-xs mb-1 ${subtleText}`}>
                 Number of creatives
               </label>
               <input
                 type="number"
                 min={1}
-                value={creativeCount}
-                onChange={(e) =>
-                  setCreativeCount(Number(e.target.value) || 0)
-                }
-                className="w-full rounded-md bg-slate-950 border border-slate-700 px-2 py-1 text-xs"
+                value={creativeCountInput}
+                onChange={(e) => setCreativeCountInput(e.target.value)}
+                className={inputBg}
+                placeholder="e.g. 10"
               />
             </div>
 
             <div>
-              <label className="block text-xs text-slate-300 mb-1">
+              <label className={`block text-xs mb-1 ${subtleText}`}>
                 Total impressions
               </label>
               <input
                 type="number"
                 min={0}
-                value={totalImpressions}
-                onChange={(e) =>
-                  setTotalImpressions(Number(e.target.value) || 0)
-                }
-                className="w-full rounded-md bg-slate-950 border border-slate-700 px-2 py-1 text-xs"
+                value={totalImpressionsInput}
+                onChange={(e) => setTotalImpressionsInput(e.target.value)}
+                className={inputBg}
+                placeholder="e.g. 100000"
               />
             </div>
 
             <div>
-              <label className="block text-xs text-slate-300 mb-1">
+              <label className={`block text-xs mb-1 ${subtleText}`}>
+                Total clicks
+              </label>
+              <input
+                type="number"
+                min={0}
+                value={totalClicksInput}
+                onChange={(e) => setTotalClicksInput(e.target.value)}
+                className={inputBg}
+                placeholder="e.g. 5000"
+              />
+            </div>
+
+            <div>
+              <label className={`block text-xs mb-1 ${subtleText}`}>
                 Total installs
               </label>
               <input
                 type="number"
                 min={0}
-                value={totalInstalls}
-                onChange={(e) =>
-                  setTotalInstalls(Number(e.target.value) || 0)
-                }
-                className="w-full rounded-md bg-slate-950 border border-slate-700 px-2 py-1 text-xs"
+                value={totalInstallsInput}
+                onChange={(e) => setTotalInstallsInput(e.target.value)}
+                className={inputBg}
+                placeholder="e.g. 2000"
               />
             </div>
 
             <div>
-              <label className="block text-xs text-slate-300 mb-1">
-                Total paid events
+              <label className={`block text-xs mb-1 ${subtleText}`}>
+                Primary event label
+              </label>
+              <input
+                type="text"
+                value={primaryEventLabel}
+                onChange={(e) => setPrimaryEventLabel(e.target.value)}
+                className={inputBg}
+                placeholder="Paid Events"
+              />
+            </div>
+
+            <div>
+              <label className={`block text-xs mb-1 ${subtleText}`}>
+                Total primary events
               </label>
               <input
                 type="number"
                 min={0}
-                value={totalPaidEvents}
-                onChange={(e) =>
-                  setTotalPaidEvents(Number(e.target.value) || 0)
-                }
-                className="w-full rounded-md bg-slate-950 border border-slate-700 px-2 py-1 text-xs"
+                value={totalPrimaryEventsInput}
+                onChange={(e) => setTotalPrimaryEventsInput(e.target.value)}
+                className={inputBg}
+                placeholder="e.g. 300"
               />
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-300 mb-1">
-                Distribution style
-              </label>
-              <select
-                value={style}
-                onChange={(e) => setStyle(e.target.value as DistributionStyle)}
-                className="w-full rounded-md bg-slate-950 border border-slate-700 px-2 py-1 text-xs"
-              >
-                <option value="balanced">
-                  Balanced (almost equal)
-                </option>
-                <option value="moderate">
-                  Moderate variance
-                </option>
-                <option value="high">
-                  High variance (few big winners)
-                </option>
-              </select>
-              <p className="text-[11px] text-slate-400 mt-1">
-                This controls how close or far apart the creatives are from
-                each other.
-              </p>
             </div>
           </div>
 
-          {error && (
-            <p className="text-xs text-rose-300">
-              {error}
-            </p>
-          )}
+          <div className="border-t border-slate-800/60 pt-4 space-y-3 text-sm">
+            <label className="inline-flex items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={secondaryEventEnabled}
+                onChange={(e) => setSecondaryEventEnabled(e.target.checked)}
+              />
+              <span className={subtleText}>Enable second event type</span>
+            </label>
 
-          <button
-            onClick={handleGenerate}
-            className="mt-2 inline-flex items-center px-3 py-1.5 rounded-md bg-emerald-500 text-slate-950 text-xs font-semibold"
-          >
-            Generate distribution
-          </button>
-        </section>
-
-        {/* Results */}
-        {rows.length > 0 && (
-          <section className="space-y-3 text-sm bg-slate-900/60 rounded-xl border border-slate-800 p-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h2 className="font-medium text-lg">Results</h2>
-                <p className="text-xs text-slate-300">
-                  Totals check — impressions: {totalsCheck.impressions} /
-                  {totalImpressions}, installs: {totalsCheck.installs} /
-                  {totalInstalls}, paid events: {totalsCheck.paidEvents} /
-                  {totalPaidEvents}
-                </p>
+            {secondaryEventEnabled && (
+              <div className="grid md:grid-cols-2 gap-4 text-sm">
+                <div>
+                  <label className={`block text-xs mb-1 ${subtleText}`}>
+                    Second event label
+                  </label>
+                  <input
+                    type="text"
+                    value={secondaryEventLabel}
+                    onChange={(e) => setSecondaryEventLabel(e.target.value)}
+                    className={inputBg}
+                    placeholder="Second Event"
+                  />
+                </div>
+                <div>
+                  <label className={`block text-xs mb-1 ${subtleText}`}>
+                    Total second events
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={totalSecondaryEventsInput}
+                    onChange={(e) =>
+                      setTotalSecondaryEventsInput(e.target.value)
+                    }
+                    className={inputBg}
+                    placeholder="e.g. 150"
+                  />
+                </div>
               </div>
+            )}
+          </div>
+
+          <div className="border-t border-slate-800/60 pt-4 flex flex-wrap gap-4 items-center text-sm">
+            <div>
+              <p className={`text-xs mb-1 ${subtleText}`}>
+                Distribution style (how different creatives are from each
+                other)
+              </p>
               <div className="flex gap-2">
                 <button
-                  onClick={handleGenerate}
-                  className="inline-flex items-center px-3 py-1.5 rounded-md bg-slate-800 text-slate-100 text-xs"
+                  onClick={() => setVariance("balanced")}
+                  className={buttonVariant(variance === "balanced")}
                 >
-                  Regenerate (same settings)
+                  Balanced
                 </button>
                 <button
-                  onClick={() => downloadCSV("creative_distribution.csv", rows)}
-                  className="inline-flex items-center px-3 py-1.5 rounded-md bg-slate-800 text-slate-100 text-xs"
+                  onClick={() => setVariance("medium")}
+                  className={buttonVariant(variance === "medium")}
                 >
-                  Download CSV
+                  Medium variance
+                </button>
+                <button
+                  onClick={() => setVariance("high")}
+                  className={buttonVariant(variance === "high")}
+                >
+                  Very skewed
                 </button>
               </div>
             </div>
 
+            <button
+              onClick={exportCsv}
+              disabled={!creatives.length}
+              className={`ml-auto px-3 py-1.5 rounded-md text-xs border ${
+                isDark
+                  ? "bg-slate-800 border-slate-600"
+                  : "bg-slate-100 border-slate-300"
+              } disabled:opacity-50`}
+            >
+              Export CSV
+            </button>
+          </div>
+        </section>
+
+        {/* Results table */}
+        <section className={`${cardBg} rounded-xl p-4 text-sm`}>
+          <h2 className="font-medium mb-2">Distributed per creative</h2>
+          {!creatives.length ? (
+            <p className={`text-xs ${subtleText}`}>
+              Set number of creatives & totals above to see the distribution.
+            </p>
+          ) : (
             <div className="overflow-x-auto">
-              <table className="w-full text-xs">
+              <table className="w-full text-[11px]">
                 <thead>
-                  <tr className="border-b border-slate-800 text-left">
-                    <th className="py-1 pr-2">Creative ID</th>
+                  <tr className="border-b border-slate-800/60 text-left">
+                    <th className="py-1 pr-2">Creative</th>
                     <th className="py-1 pr-2">Impressions</th>
+                    <th className="py-1 pr-2">Clicks</th>
                     <th className="py-1 pr-2">Installs</th>
-                    <th className="py-1 pr-2">Paid events</th>
+                    <th className="py-1 pr-2">{primaryEventLabel}</th>
+                    {secondaryEventEnabled && (
+                      <th className="py-1 pr-2">{secondaryEventLabel}</th>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((r) => (
-                    <tr key={r.id} className="border-b border-slate-900">
-                      <td className="py-1 pr-2">{r.id}</td>
-                      <td className="py-1 pr-2">{r.impressions}</td>
-                      <td className="py-1 pr-2">{r.installs}</td>
-                      <td className="py-1 pr-2">{r.paidEvents}</td>
+                  {creatives.map((row) => (
+                    <tr
+                      key={row.index}
+                      className={`border-b border-slate-900/40 ${
+                        isDark ? "even:bg-slate-900/40" : "even:bg-slate-100/60"
+                      }`}
+                    >
+                      <td className="py-1 pr-2">{row.name}</td>
+                      <td className="py-1 pr-2">{row.impressions}</td>
+                      <td className="py-1 pr-2">{row.clicks}</td>
+                      <td className="py-1 pr-2">{row.installs}</td>
+                      <td className="py-1 pr-2">{row.primaryEvents}</td>
+                      {secondaryEventEnabled && (
+                        <td className="py-1 pr-2">{row.secondaryEvents}</td>
+                      )}
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
-          </section>
-        )}
+          )}
+        </section>
       </div>
     </div>
   );
 };
 
-export default CreativeDistributorPage;
+export default Page;
